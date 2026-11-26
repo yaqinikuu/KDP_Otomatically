@@ -220,11 +220,18 @@ class FileSalahError(Exception):
     """File input yang dipilih bukan file yang seharusnya."""
 
 
-def _baca_excel(path, jenis):
-    try:
-        return pd.read_excel(path)
-    except (zipfile.BadZipFile, ValueError) as e:
-        raise FileSalahError(f"{NAMA_JENIS[jenis]} bukan file Excel yang valid.") from e
+def _baca_excel(path, jenis, kolom=None):
+    """Baca Excel dengan engine calamine (jauh lebih cepat dan hemat memori); kalau gagal,
+    jatuh ke openpyxl. 'kolom' = daftar kolom yang dibaca saja (None = semua kolom)."""
+    terakhir = None
+    for engine, uc in (("calamine", kolom), ("openpyxl", None)):
+        try:
+            return pd.read_excel(path, engine=engine, usecols=uc)
+        except Exception as e:
+            terakhir = e
+    if isinstance(terakhir, (zipfile.BadZipFile, ValueError)):
+        raise FileSalahError(f"{NAMA_JENIS[jenis]} bukan file Excel yang valid.") from terakhir
+    raise terakhir
 
 
 def _wajib_kolom(df, jenis, wajib):
@@ -252,13 +259,15 @@ def tahap_cleaning(path_kdp, path_keputusan, path_5keputusan, sheet_target, lapo
         df["Id"] = buat_id(df)
         df = df.sort_values(by="Tgl_Surat", ascending=False)
         df_clean = df.drop_duplicates(subset=["Id"], keep="first").copy()
+        del df
 
         # 4. Keputusan Klaim -> tulis ke sheet tujuan di file 5 Keputusan
         _l(0.25, "Membaca Keputusan Klaim...")
-        df2 = _baca_excel(path_keputusan, "keputusan")
+        df2 = _baca_excel(path_keputusan, "keputusan", kolom=KOLOM_KEPUTUSAN)
         _wajib_kolom(df2, "keputusan", KOLOM_KEPUTUSAN)
         df2["Id"] = buat_id(df2)
         id_df2 = df2[["Id", "status_keputusan"]].rename(columns={"status_keputusan": "status"})
+        del df2
 
         _l(0.40, "Memeriksa file 5 Keputusan All...")
         try:
