@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import load_workbook
 
 PNM = "PERMODALAN NASIONAL MADANI"
@@ -233,13 +234,19 @@ def _wajib_kolom(df, jenis, wajib):
             f"{NAMA_JENIS[jenis]} tidak sesuai, kolom tidak ditemukan: {', '.join(kurang)}.")
 
 
-def tahap_cleaning(path_kdp, path_keputusan, path_5keputusan, sheet_target):
+def tahap_cleaning(path_kdp, path_keputusan, path_5keputusan, sheet_target, lapor=None):
     """Tahap 1: cleaning sampai dapat data 'belum ada putusan'.
+    'lapor(fraksi, teks)' (opsional) dipanggil di tiap tahap untuk progress bar.
     Kalau gagal setelah file 5 Keputusan ditulis, isinya dikembalikan dari backup."""
+    def _l(fraksi, teks):
+        if lapor:
+            lapor(fraksi, teks)
+
     bak = path_5keputusan + ".bak"
     sudah_menulis = False
     try:
         # 1-3. File KDP, buat Id, sort, buang duplikat
+        _l(0.02, "Membaca KDP Klaim...")
         df = _baca_excel(path_kdp, "kdp")
         _wajib_kolom(df, "kdp", KOLOM_KDP)
         df["Id"] = buat_id(df)
@@ -247,11 +254,13 @@ def tahap_cleaning(path_kdp, path_keputusan, path_5keputusan, sheet_target):
         df_clean = df.drop_duplicates(subset=["Id"], keep="first").copy()
 
         # 4. Keputusan Klaim -> tulis ke sheet tujuan di file 5 Keputusan
+        _l(0.25, "Membaca Keputusan Klaim...")
         df2 = _baca_excel(path_keputusan, "keputusan")
         _wajib_kolom(df2, "keputusan", KOLOM_KEPUTUSAN)
         df2["Id"] = buat_id(df2)
         id_df2 = df2[["Id", "status_keputusan"]].rename(columns={"status_keputusan": "status"})
 
+        _l(0.40, "Memeriksa file 5 Keputusan All...")
         try:
             _, valid = _hitung_sheet_valid(path_5keputusan)
         except (zipfile.BadZipFile, KeyError) as e:
@@ -260,6 +269,7 @@ def tahap_cleaning(path_kdp, path_keputusan, path_5keputusan, sheet_target):
             raise FileSalahError(
                 "5 Keputusan All tidak sesuai, tidak ada sheet dengan kolom 'id' dan 'status'.")
 
+        _l(0.45, "Menulis sheet ke 5 Keputusan All...")
         shutil.copy2(path_5keputusan, bak)
         sudah_menulis = True
         with pd.ExcelWriter(path_5keputusan, engine="openpyxl", mode="a",
@@ -267,13 +277,16 @@ def tahap_cleaning(path_kdp, path_keputusan, path_5keputusan, sheet_target):
             id_df2.to_excel(writer, sheet_name=sheet_target, index=False)
 
         # 5. Baca semua sheet 5 Keputusan
+        _l(0.60, "Membuka file 5 Keputusan All...")
         try:
             xls = pd.ExcelFile(path_5keputusan, engine="calamine")
         except Exception:
             xls = pd.ExcelFile(path_5keputusan, engine="openpyxl")
 
         frames, dilewati = [], []
-        for nama in xls.sheet_names:
+        n_sheet = max(1, len(xls.sheet_names))
+        for i, nama in enumerate(xls.sheet_names):
+            _l(0.65 + 0.25 * i / n_sheet, f"Membaca sheet '{nama}' ({i + 1}/{n_sheet})...")
             s = baca_sheet(xls, nama)
             if s is None:
                 dilewati.append(nama)
@@ -288,6 +301,7 @@ def tahap_cleaning(path_kdp, path_keputusan, path_5keputusan, sheet_target):
             raise ValueError("Tidak ada sheet yang punya kolom 'id' dan 'status'.")
 
         # 6. Lookup
+        _l(0.92, "Mencocokkan status keputusan...")
         lookup = pd.concat(frames, ignore_index=True)
         lookup = lookup.drop_duplicates(subset="ID", keep="first")
         lookup["Status"] = (
@@ -486,6 +500,104 @@ div[data-testid="stAlert"] { border-radius: 16px; }
 </style>
 """
 st.markdown(CSS_GLASS, unsafe_allow_html=True)
+
+# Kartu progres upload (persen, kecepatan, sisa waktu). Memantau request upload bawaan
+# uploader di browser, jadi tidak mengubah cara kerja file_uploader.
+JS_UPLOAD = """
+<script>
+(function () {
+  var P = window.parent;
+  if (!P || P.__kdpUploadPatched) return;
+  P.__kdpUploadPatched = true;
+  var D = P.document;
+
+  var box = D.createElement('div');
+  box.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:99999;min-width:270px;' +
+    'padding:14px 16px;border-radius:20px;font:14px system-ui,sans-serif;color:#1f2a44;' +
+    'background:rgba(255,255,255,.65);backdrop-filter:blur(24px) saturate(180%);' +
+    '-webkit-backdrop-filter:blur(24px) saturate(180%);border:1px solid rgba(255,255,255,.8);' +
+    'box-shadow:0 10px 40px rgba(60,80,160,.22);display:none';
+  box.innerHTML =
+    '<div class="t" style="font-weight:600;margin-bottom:8px"></div>' +
+    '<div style="height:8px;border-radius:99px;background:rgba(90,110,190,.18);overflow:hidden">' +
+    '<div class="b" style="height:100%;width:0;border-radius:99px;transition:width .2s;' +
+    'background:linear-gradient(90deg,#5b9cff,#3a78f2)"></div></div>' +
+    '<div class="s" style="margin-top:8px;font-size:12px;color:#55607e"></div>';
+  D.body.appendChild(box);
+  var elT = box.querySelector('.t'), elB = box.querySelector('.b'), elS = box.querySelector('.s');
+
+  var batch = [], speed = 0, lastBytes = 0, lastTime = 0, timer = null, hideTimer = null;
+
+  function mb(x) { return (x / 1048576).toFixed(1); }
+  function fmtTime(s) {
+    if (!isFinite(s) || s < 0) return '--:--';
+    s = Math.round(s);
+    var m = Math.floor(s / 60), d = s % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (d < 10 ? '0' : '') + d;
+  }
+  function sums() {
+    var l = 0, t = 0, done = true;
+    batch.forEach(function (r) { l += r.loaded; t += r.total; if (!r.done) done = false; });
+    return { l: l, t: t, done: done };
+  }
+  function render() {
+    var s = sums(), pct = s.t > 0 ? Math.min(100, s.l / s.t * 100) : 0;
+    elB.style.width = pct.toFixed(1) + '%';
+    if (s.done) {
+      elT.textContent = 'Upload selesai (' + mb(s.t) + ' MB)';
+      elS.textContent = '100%';
+    } else {
+      elT.textContent = 'Mengunggah... ' + pct.toFixed(0) + '%';
+      var eta = speed > 0 ? (s.t - s.l) / speed : Infinity;
+      elS.textContent = mb(s.l) + ' / ' + mb(s.t) + ' MB  \\u2022  ' +
+        (speed / 1048576).toFixed(2) + ' MB/s  \\u2022  sisa ' + fmtTime(eta);
+    }
+  }
+  function tick() {
+    var now = Date.now(), s = sums();
+    var inst = (s.l - lastBytes) / ((now - lastTime) / 1000);
+    speed = speed ? speed * 0.6 + inst * 0.4 : inst;
+    lastBytes = s.l; lastTime = now;
+    render();
+    if (s.done) {
+      clearInterval(timer); timer = null;
+      hideTimer = setTimeout(function () { box.style.display = 'none'; batch = []; }, 3000);
+    }
+  }
+  function mulai(rec) {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    if (sums().done) { batch = []; speed = 0; lastBytes = 0; }   // batch baru
+    batch.push(rec);
+    box.style.display = 'block';
+    if (!timer) { lastTime = Date.now(); lastBytes = sums().l; timer = setInterval(tick, 400); }
+    render();
+  }
+
+  var XHR = P.XMLHttpRequest.prototype;
+  var oOpen = XHR.open, oSend = XHR.send;
+  XHR.open = function (m, u) { this.__kdpUrl = String(u); return oOpen.apply(this, arguments); };
+  XHR.send = function (body) {
+    try {
+      if (this.__kdpUrl && this.__kdpUrl.indexOf('upload_file') !== -1 && body) {
+        var rec = { loaded: 0, total: (body.size || 0), done: false };
+        mulai(rec);
+        this.upload.addEventListener('progress', function (e) {
+          rec.loaded = e.loaded;
+          if (e.lengthComputable) rec.total = e.total;
+        });
+        this.addEventListener('loadend', function () {
+          rec.done = true;
+          if (rec.total) rec.loaded = rec.total;
+        });
+      }
+    } catch (err) {}
+    return oSend.apply(this, arguments);
+  };
+})();
+</script>
+"""
+components.html(JS_UPLOAD, height=0)
+
 st.title("Otomatisasi KDP Klaim")
 
 # ---------- Langkah 1 ----------
@@ -552,9 +664,17 @@ if st.button("Proses Cleaning", type="primary", disabled=not semua_siap):
         p_kdp, p_kep, p_lima = (
             shutil.copy2(siap[j][0], kerja) for j in ("kdp", "keputusan", "lima")
         )
+        bar = st.progress(0.0, text="Memulai...")
+
+        def lapor(fraksi, teks):
+            bar.progress(min(max(fraksi, 0.0), 1.0),
+                         text=f"{teks}  •  {format_waktu(time.time() - t0)}")
+
         try:
-            with st.spinner("Memproses cleaning, mohon tunggu..."):
-                df_bersih, dilewati = tahap_cleaning(p_kdp, p_kep, p_lima, sheet)
+            try:
+                df_bersih, dilewati = tahap_cleaning(p_kdp, p_kep, p_lima, sheet, lapor=lapor)
+            finally:
+                bar.empty()
             with open(p_lima, "rb") as f:
                 st.session_state["hasil_5"] = (os.path.basename(p_lima), f.read())
             st.session_state["df_bersih"] = df_bersih
